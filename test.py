@@ -6,11 +6,27 @@ import os    # Додаємо для перевірки наявності фа�
 import sys
 
 def resource_path(path):
-    try:
+    """Resolve assets both when launched from VS Code and from a PyInstaller build."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, path)
+    else:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+
+    # Accept existing relative paths as well as the project's legacy flat asset names.
+    candidates = [
+        os.path.join(base_path, path),
+        os.path.join(base_path, "image", path),
+        os.path.join(base_path, "assets", "images", path),
+    ]
+    normalized = os.path.normpath(path)
+    if normalized.startswith("image" + os.sep):
+        candidates.insert(0, os.path.join(base_path, normalized))
+        candidates.append(os.path.join(base_path, "assets", "images", normalized[len("image" + os.sep):]))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    # Return the canonical project-relative path so the fallback texture logic can run.
+    return candidates[0]
 
 pg.init()
 
@@ -439,7 +455,7 @@ def load_texture(path, size):
     if key not in texture_cache:
         try:
             img = pg.image.load(resource_path(path)).convert_alpha()
-        except pg.error:
+        except (pg.error, FileNotFoundError, OSError):
             img = pg.Surface(size, pg.SRCALPHA)
             if path == "water.png":
                 img.fill((80, 0, 200, 200)) 
@@ -966,6 +982,7 @@ class Enderman:
     def __init__(self, x, y):
         self.rect = pg.Rect(x, y, 40, BLOCK_SIZE * 3)
         self.speed = random.choice([-1, 1])
+        self.facing_left = False
         self.attack_cooldown = 0.0
         self.teleport_cooldown = random.uniform(1.5, 4.0)
         self.walk_frame = random.randint(0, 2)
@@ -974,9 +991,8 @@ class Enderman:
     def update(self, dt):
         distance = math.hypot(self.rect.centerx - player.rect.centerx,
                               self.rect.centery - player.rect.centery)
-        if distance > BLOCK_SIZE * 28:
-            return True
-
+        # Mob simulation is independent of whether it is currently visible.
+        # Keep distant mobs alive; only reduce movement/decision frequency if needed later.
         self.attack_cooldown = max(0.0, self.attack_cooldown - dt)
         self.animation_timer += dt
         if self.animation_timer >= 0.16:
@@ -984,7 +1000,9 @@ class Enderman:
             self.animation_timer = 0.0
         self.teleport_cooldown -= dt
         if distance > BLOCK_SIZE * 3:
-            self.rect.x += int(self.speed * 1.2)
+            direction = 1 if player.rect.centerx > self.rect.centerx else -1
+            self.facing_left = direction < 0
+            self.rect.x += int(direction * 72 * dt)
         elif self.attack_cooldown <= 0.0 and self.rect.colliderect(player.rect):
             if not is_creative:
                 player.health -= 2
@@ -1004,8 +1022,12 @@ class Enderman:
         if x + w < 0 or x > WIDTH or y + h < 0 or y > HEIGHT:
             return
         texture_name = f"enderman_walk{self.walk_frame + 1}.png"
-        if os.path.exists(resource_path(texture_name)):
-            screen.blit(load_texture(texture_name, (w, h)), (x, y))
+        texture_path = resource_path(texture_name)
+        if os.path.exists(texture_path):
+            image = load_texture(texture_name, (w, h))
+            if self.facing_left:
+                image = pg.transform.flip(image, True, False)
+            screen.blit(image, (x, y))
         else:
             # Запасний вигляд, поки три PNG ще не покладені поруч із грою.
             pg.draw.rect(screen, (18, 14, 25), (x, y, w, h), border_radius=max(1, w // 6))
@@ -1041,7 +1063,7 @@ class EnderDragon:
         self.rect = pg.Rect(150 * BLOCK_SIZE, -2060 * BLOCK_SIZE, 900, 450)
         self.max_health = 200
         self.health = self.max_health
-        self.speed = 8 
+        self.speed = 10
         self.angle = 0
         self.active = False
         self.target_x = 100 * BLOCK_SIZE
@@ -1052,6 +1074,11 @@ class EnderDragon:
         self.facing_right = False
         self.shoot_cooldown = 0
         self.hit_cooldown = 0
+        self.crystal_scan_timer = 0.0
+        self.cached_crystals = []
+        self.crystal_heal_timer = 0.0
+        self.landing_timer = 0.0
+        self.is_landing = False
 
     def update(self):
         if player.rect.y < -2000 * BLOCK_SIZE and not self.active and self.health > 0:
@@ -1061,16 +1088,24 @@ class EnderDragon:
             return
 
         self.anim_timer += 1
-        if self.anim_timer >= 15: 
+        if self.anim_timer >= 10:
             self.anim_frame = 1 if self.anim_frame == 0 else 0
             self.anim_timer = 0
 
-        crystals = [b for b in blocks_map.values() if b.texture == "end_crystal.png"]
-        for c in crystals:
-            dist = math.hypot(c.rect.x - self.rect.centerx, c.rect.y - self.rect.centery)
-            if dist < 1200:
-                self.health = min(self.max_health, self.health + 0.1)
-                self.crystal_link = (c.rect.centerx, c.rect.centery)
+        # Searching every block each frame was a major source of lag in the End.
+        # Refresh the crystal cache twice per second instead.
+        self.crystal_scan_timer += 1.0 / 60.0
+        if self.crystal_scan_timer >= 0.5:
+            self.crystal_scan_timer = 0.0
+            self.cached_crystals = [b for b in blocks_map.values() if b.texture == "end_crystal.png"]
+        self.crystal_heal_timer += 1.0 / 60.0
+        if self.crystal_heal_timer >= 0.5:
+            self.crystal_heal_timer = 0.0
+            for c in self.cached_crystals:
+                if math.hypot(c.rect.centerx - self.rect.centerx, c.rect.centery - self.rect.centery) < 1200:
+                    self.health = min(self.max_health, self.health + 0.5)
+                    self.crystal_link = (c.rect.centerx, c.rect.centery)
+                    break
 
         self.attack_timer += 1
         if self.attack_timer > 200:
@@ -1113,7 +1148,9 @@ class EnderDragon:
         self.shoot_cooldown += 1
         if self.shoot_cooldown > 90:
             self.shoot_cooldown = 0
-            dragon_fireballs.append(DragonFireball(self.rect.centerx, self.rect.centery, player.rect.centerx, player.rect.centery))
+            mouth_x = self.rect.right - 70 if not self.facing_right else self.rect.left + 70
+            mouth_y = self.rect.y + int(self.rect.h * 0.58)
+            dragon_fireballs.append(DragonFireball(mouth_x, mouth_y, player.rect.centerx, player.rect.centery))
 
     def draw(self, screen, camera_x, camera_y):
         if not self.active or player.rect.y > -2000 * BLOCK_SIZE:
@@ -3734,11 +3771,9 @@ while running:
 
     update_furnace_smelting()
 
-    for plant in growing_plants:
-        p_screen_x = int((plant.rect.x - camera_x) * camera_scale)
-        p_screen_y = int((plant.rect.y - camera_y) * camera_scale)
-        if -50 <= p_screen_x <= WIDTH + 50 and -50 <= p_screen_y <= HEIGHT + 50:
-            plant.update_growth(1.0 / 60.0)
+    # World simulation (plant growth) must not depend on camera visibility.
+    for plant in growing_plants[:]:
+        plant.update_growth(1.0 / 60.0)
 
     for f in fishes:
         f.update()
